@@ -98,15 +98,15 @@ echo "Using zone: $VM_ZONE for VM creation"
 # Find a valid Windows image to use
 echo "Finding available Windows images..."
 # Try these image families in order of preference
-IMAGE_FAMILIES=("windows-server-2022-dc" "windows-server-2019-dc" "windows-server-2016-dc" "windows-server-2012-r2-dc")
+IMAGE_FAMILIES=("windows-server-2025-dc" "windows-server-2022-dc" "windows-server-2019-dc" "windows-server-2016-dc" "windows-server-2012-r2-dc")
 IMAGE_FOUND=false
 
 for FAMILY in "${IMAGE_FAMILIES[@]}"; do
     echo "Checking image family: $FAMILY"
     IMAGE_INFO=$(gcloud compute images describe-from-family $FAMILY --project=windows-cloud --format="value(name)" 2>/dev/null)
     if [ -n "$IMAGE_INFO" ]; then
-        echo "Using image family: $FAMILY"
-        IMAGE_FAMILY="$FAMILY"
+        echo "Using image: $IMAGE_INFO from family: $FAMILY"
+        WINDOWS_IMAGE="$IMAGE_INFO"
         IMAGE_FOUND=true
         break
     fi
@@ -115,54 +115,45 @@ done
 if [ "$IMAGE_FOUND" != "true" ]; then
     echo "Falling back to listing available Windows images..."
     # Get the most recent Windows Server image
-    LATEST_IMAGE=$(gcloud compute images list --project=windows-cloud --filter="name~'windows-server'" --sort-by=~creationTimestamp --limit=1 --format="value(name)")
-    if [ -n "$LATEST_IMAGE" ]; then
-        echo "Using specific image: $LATEST_IMAGE"
-        USE_SPECIFIC_IMAGE=true
+    WINDOWS_IMAGE=$(gcloud compute images list --project=windows-cloud --filter="name~'windows-server'" --sort-by=~creationTimestamp --limit=1 --format="value(name)")
+    if [ -n "$WINDOWS_IMAGE" ]; then
+        echo "Using specific image: $WINDOWS_IMAGE"
     else
         echo "Error: No Windows Server images available. Please check your permissions."
         exit 1
     fi
 fi
 
+# Determine default service account
+DEFAULT_SA=$(gcloud iam service-accounts list --filter="displayName:Compute Engine default service account" --format="value(email)" --limit=1)
+if [ -z "$DEFAULT_SA" ]; then
+    # Fallback to project number based service account
+    PROJECT_NUMBER=$(gcloud projects describe "$CURRENT_PROJECT" --format="value(projectNumber)")
+    DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+fi
+echo "Using service account: $DEFAULT_SA"
+
 # Create a unique instance name
 VM_NAME="${UNIQUE_PREFIX}"
 echo "Creating VM: $VM_NAME in zone: $VM_ZONE"
 
-# Create the VM command
-if [ "$USE_SPECIFIC_IMAGE" == "true" ]; then
-    # Use specific image
-    gcloud compute instances create "$VM_NAME" \
-        --zone="$VM_ZONE" \
-        --machine-type="n1-standard-1" \
-        --network-tier="PREMIUM" \
-        --subnet="default" \
-        --metadata="enable-oslogin=true" \
-        --maintenance-policy="MIGRATE" \
-        --image-project="windows-cloud" \
-        --image="$LATEST_IMAGE" \
-        --boot-disk-size="50GB" \
-        --boot-disk-type="pd-balanced" \
-        --no-shielded-secure-boot \
-        --shielded-vtpm \
-        --shielded-integrity-monitoring
-else
-    # Use image family
-    gcloud compute instances create "$VM_NAME" \
-        --zone="$VM_ZONE" \
-        --machine-type="n1-standard-1" \
-        --network-tier="PREMIUM" \
-        --subnet="default" \
-        --metadata="enable-oslogin=true" \
-        --maintenance-policy="MIGRATE" \
-        --image-project="windows-cloud" \
-        --image-family="$IMAGE_FAMILY" \
-        --boot-disk-size="50GB" \
-        --boot-disk-type="pd-balanced" \
-        --no-shielded-secure-boot \
-        --shielded-vtpm \
-        --shielded-integrity-monitoring
-fi
+# Create the Windows VM with parameters similar to the example
+gcloud compute instances create "$VM_NAME" \
+    --project="$CURRENT_PROJECT" \
+    --zone="$VM_ZONE" \
+    --machine-type="n1-standard-1" \
+    --network-interface="network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default" \
+    --metadata="enable-osconfig=TRUE,enable-oslogin=true" \
+    --maintenance-policy="MIGRATE" \
+    --provisioning-model="STANDARD" \
+    --service-account="$DEFAULT_SA" \
+    --scopes="https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append" \
+    --create-disk="auto-delete=yes,boot=yes,device-name=$VM_NAME,image=projects/windows-cloud/global/images/$WINDOWS_IMAGE,mode=rw,size=50,type=pd-balanced" \
+    --no-shielded-secure-boot \
+    --shielded-vtpm \
+    --shielded-integrity-monitoring \
+    --labels="goog-ops-agent-policy=v2-x86-template-1-4-0,goog-ec-src=vm_add-gcloud" \
+    --reservation-affinity="any"
 
 # Check if VM was created successfully
 if [ $? -ne 0 ]; then
@@ -171,8 +162,8 @@ if [ $? -ne 0 ]; then
 fi
 
 # Wait for VM to be ready
-echo "Waiting for VM to initialize (45 seconds)..."
-sleep 45
+echo "Waiting for VM to initialize (60 seconds)..."
+sleep 60
 
 # Get the external IP address with retry
 MAX_RETRIES=3
@@ -184,6 +175,15 @@ for ((i=1; i<=MAX_RETRIES; i++)); do
     echo "Waiting for IP address to be assigned (attempt $i/$MAX_RETRIES)..."
     sleep 10
 done
+
+# Try to create the ops-agent policy (but continue if it fails)
+echo "Attempting to configure ops-agent policy..."
+printf 'agentsRule:\n  packageState: installed\n  version: latest\ninstanceFilter:\n  inclusionLabels:\n  - labels:\n      goog-ops-agent-policy: v2-x86-template-1-4-0\n' > config.yaml
+POLICY_NAME="goog-ops-agent-v2-x86-template-1-4-0-${VM_ZONE}"
+gcloud compute instances ops-agents policies create "$POLICY_NAME" \
+    --project="$CURRENT_PROJECT" \
+    --zone="$VM_ZONE" \
+    --file=config.yaml 2>/dev/null || echo "Note: Ops agent policy creation skipped (may require additional permissions)"
 
 # Print the information
 echo "========================================"
