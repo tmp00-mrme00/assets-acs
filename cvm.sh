@@ -30,25 +30,74 @@ if [ "$ZONE_VALID" != "true" ]; then
   exit 1
 fi
 
+# Find a valid Windows image to use
+echo "Finding available Windows images..."
+# Try these image families in order of preference
+IMAGE_FAMILIES=("windows-server-2022-dc" "windows-server-2019-dc" "windows-server-2016-dc" "windows-server-2012-r2-dc")
+IMAGE_FOUND=false
+
+for FAMILY in "${IMAGE_FAMILIES[@]}"; do
+  echo "Checking image family: $FAMILY"
+  IMAGE_INFO=$(gcloud compute images describe-from-family $FAMILY --project=windows-cloud --format="value(name)" 2>/dev/null)
+  if [ -n "$IMAGE_INFO" ]; then
+    echo "Using image family: $FAMILY"
+    IMAGE_FAMILY="$FAMILY"
+    IMAGE_FOUND=true
+    break
+  fi
+done
+
+if [ "$IMAGE_FOUND" != "true" ]; then
+  echo "Falling back to listing available Windows images..."
+  # Get the most recent Windows Server image
+  LATEST_IMAGE=$(gcloud compute images list --project=windows-cloud --filter="name~'windows-server'" --sort-by=~creationTimestamp --limit=1 --format="value(name)")
+  if [ -n "$LATEST_IMAGE" ]; then
+    echo "Using specific image: $LATEST_IMAGE"
+    USE_SPECIFIC_IMAGE=true
+  else
+    echo "Error: No Windows Server images available. Please check your permissions."
+    exit 1
+  fi
+fi
+
 # Create a unique instance name
 VM_NAME="${UNIQUE_PREFIX}"
 echo "Creating VM: $VM_NAME in zone: $VM_ZONE"
 
-# Create the VM
-gcloud compute instances create "$VM_NAME" \
-    --zone="$VM_ZONE" \
-    --machine-type="n1-standard-1" \
-    --network-tier="PREMIUM" \
-    --subnet="default" \
-    --metadata="enable-oslogin=true" \
-    --maintenance-policy="MIGRATE" \
-    --image-project="windows-cloud" \
-    --image-family="windows-server-2022-dc-core" \
-    --boot-disk-size="50GB" \
-    --boot-disk-type="pd-balanced" \
-    --no-shielded-secure-boot \
-    --shielded-vtpm \
-    --shielded-integrity-monitoring
+# Create the VM command
+if [ "$USE_SPECIFIC_IMAGE" == "true" ]; then
+  # Use specific image
+  gcloud compute instances create "$VM_NAME" \
+      --zone="$VM_ZONE" \
+      --machine-type="n1-standard-1" \
+      --network-tier="PREMIUM" \
+      --subnet="default" \
+      --metadata="enable-oslogin=true" \
+      --maintenance-policy="MIGRATE" \
+      --image-project="windows-cloud" \
+      --image="$LATEST_IMAGE" \
+      --boot-disk-size="50GB" \
+      --boot-disk-type="pd-balanced" \
+      --no-shielded-secure-boot \
+      --shielded-vtpm \
+      --shielded-integrity-monitoring
+else
+  # Use image family
+  gcloud compute instances create "$VM_NAME" \
+      --zone="$VM_ZONE" \
+      --machine-type="n1-standard-1" \
+      --network-tier="PREMIUM" \
+      --subnet="default" \
+      --metadata="enable-oslogin=true" \
+      --maintenance-policy="MIGRATE" \
+      --image-project="windows-cloud" \
+      --image-family="$IMAGE_FAMILY" \
+      --boot-disk-size="50GB" \
+      --boot-disk-type="pd-balanced" \
+      --no-shielded-secure-boot \
+      --shielded-vtpm \
+      --shielded-integrity-monitoring
+fi
 
 # Check if VM was created successfully
 if [ $? -ne 0 ]; then
