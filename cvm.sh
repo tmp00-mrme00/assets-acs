@@ -1,35 +1,42 @@
 #!/bin/bash
 
+# Generate unique identifiers
+RANDOM_ID=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 6)
+TIMESTAMP=$(date +%Y%m%d%H%M%S)
+UNIQUE_PREFIX="winvm-${RANDOM_ID}-${TIMESTAMP}"
+
 # Use the current project and authentication
-PROJECT=$(gcloud config get-value project)
-echo "Using project: $PROJECT"
+CURRENT_PROJECT=$(gcloud config get-value project)
+echo "Using project: $CURRENT_PROJECT"
 
 # Find allowed zones in the project
 echo "Finding allowed zones for your project..."
-AVAILABLE_ZONES=$(gcloud compute zones list --format="value(name)" --limit=10)
+ZONE_LIST=$(gcloud compute zones list --format="value(name)" --limit=15)
 
 # Try each zone until one works
-for ZONE in $AVAILABLE_ZONES; do
-  echo "Testing zone: $ZONE"
-  if gcloud compute instances list --zones="$ZONE" >/dev/null 2>&1; then
-    echo "Found valid zone: $ZONE"
-    ZONE_FOUND=true
+ZONE_VALID=false
+for TEST_ZONE in $ZONE_LIST; do
+  echo "Testing zone: $TEST_ZONE"
+  if gcloud compute instances list --zones="$TEST_ZONE" >/dev/null 2>&1; then
+    echo "Found valid zone: $TEST_ZONE"
+    ZONE_VALID=true
+    VM_ZONE="$TEST_ZONE"
     break
   fi
 done
 
-if [ "$ZONE_FOUND" != "true" ]; then
+if [ "$ZONE_VALID" != "true" ]; then
   echo "Error: Could not find a valid zone. Please check project permissions."
   exit 1
 fi
 
 # Create a unique instance name
-INSTANCE_NAME="win-vm-$(date +%Y%m%d%H%M%S)"
-echo "Creating VM: $INSTANCE_NAME in zone: $ZONE"
+VM_NAME="${UNIQUE_PREFIX}"
+echo "Creating VM: $VM_NAME in zone: $VM_ZONE"
 
 # Create the VM
-gcloud compute instances create "$INSTANCE_NAME" \
-    --zone="$ZONE" \
+gcloud compute instances create "$VM_NAME" \
+    --zone="$VM_ZONE" \
     --machine-type="n1-standard-1" \
     --network-tier="PREMIUM" \
     --subnet="default" \
@@ -43,20 +50,38 @@ gcloud compute instances create "$INSTANCE_NAME" \
     --shielded-vtpm \
     --shielded-integrity-monitoring
 
-# Wait for VM to be ready
-echo "Waiting for VM to initialize (30 seconds)..."
-sleep 30
+# Check if VM was created successfully
+if [ $? -ne 0 ]; then
+  echo "Error: Failed to create VM. Please check permissions and quotas."
+  exit 1
+fi
 
-# Get the external IP address
-EXTERNAL_IP=$(gcloud compute instances describe "$INSTANCE_NAME" --zone="$ZONE" --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null)
+# Wait for VM to be ready
+echo "Waiting for VM to initialize (45 seconds)..."
+sleep 45
+
+# Get the external IP address with retry
+MAX_RETRIES=3
+for ((i=1; i<=MAX_RETRIES; i++)); do
+  VM_IP=$(gcloud compute instances describe "$VM_NAME" --zone="$VM_ZONE" --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null)
+  if [ -n "$VM_IP" ]; then
+    break
+  fi
+  echo "Waiting for IP address to be assigned (attempt $i/$MAX_RETRIES)..."
+  sleep 10
+done
 
 # Print the information
 echo "========================================"
 echo "WINDOWS VM CREATION COMPLETE"
 echo "========================================"
-echo "VM Name: $INSTANCE_NAME"
-echo "Project: $PROJECT"
-echo "Zone: $ZONE"
-echo "External IP Address: $EXTERNAL_IP"
+echo "VM Name: $VM_NAME"
+echo "Project: $CURRENT_PROJECT"
+echo "Zone: $VM_ZONE"
+echo "External IP Address: $VM_IP"
 echo "Authentication: Use your Google account credentials."
+echo "========================================"
+echo "Remote Desktop Info:"
+echo "Username: Your Google Identity"
+echo "Password: Your Google Authentication"
 echo "========================================"
