@@ -9,12 +9,34 @@ if [ -z "$PROJECT" ]; then
   exit 1
 fi
 
-# Set variables
-# **IMPORTANT: Change the ZONE to a location allowed by your project's policies**
-ZONE="us-central1-a"  # Replace with a VALID zone for your project!
-INSTANCE_NAME="instance-20250320-160519"
+# Find allowed zones in the project
+echo "Finding allowed zones for your project..."
+# Try to get a list of zones and select the first one that works
+AVAILABLE_ZONES=$(gcloud compute zones list --format="value(name)" --limit=10)
 
-# Create the VM (using your provided command, slightly modified for clarity)
+# Variable to track if we found a working zone
+ZONE_FOUND=false
+
+for ZONE in $AVAILABLE_ZONES; do
+  echo "Testing zone: $ZONE"
+  # Try to validate the zone by listing instances in it
+  if gcloud compute instances list --zones="$ZONE" --project="$PROJECT" >/dev/null 2>&1; then
+    echo "Found valid zone: $ZONE"
+    ZONE_FOUND=true
+    break
+  fi
+done
+
+if [ "$ZONE_FOUND" = false ]; then
+  echo "Error: Could not find a valid zone for your project. Please specify a zone manually."
+  exit 1
+fi
+
+INSTANCE_NAME="windows-vm-$(date +%Y%m%d%H%M%S)"
+echo "Using zone: $ZONE for instance: $INSTANCE_NAME"
+
+# Create the VM
+echo "Creating VM..."
 gcloud compute instances create "$INSTANCE_NAME" \
     --project="$PROJECT" \
     --zone="$ZONE" \
@@ -23,31 +45,28 @@ gcloud compute instances create "$INSTANCE_NAME" \
     --metadata="enable-osconfig=TRUE,enable-oslogin=true" \
     --maintenance-policy="MIGRATE" \
     --provisioning-model="STANDARD" \
-    --service-account="235271429094-compute@developer.gserviceaccount.com" \
     --scopes="https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append" \
-    --create-disk="auto-delete=yes,boot=yes,device-name=$INSTANCE_NAME,image=projects/windows-cloud/global/images/windows-server-2025-dc-v20250312,mode=rw,size=50,type=pd-balanced" \
+    --create-disk="auto-delete=yes,boot=yes,device-name=$INSTANCE_NAME,image=projects/windows-cloud/global/images/windows-server-2022-dc-v20240212,mode=rw,size=50,type=pd-balanced" \
     --no-shielded-secure-boot \
     --shielded-vtpm \
     --shielded-integrity-monitoring \
-    --labels="goog-ops-agent-policy=v2-x86-template-1-4-0,goog-ec-src=vm_add-gcloud" \
     --reservation-affinity="any"
 
-# Wait for the VM to be ready (optional, but recommended)
-echo "Waiting for VM to start..."
-gcloud compute instances wait-until-running "$INSTANCE_NAME" --zone "$ZONE" --project "$PROJECT"
+# Simple wait instead of wait-until-running
+echo "Waiting for VM to start (30 seconds)..."
+sleep 30
 
 # Get the external IP address
-EXTERNAL_IP=$(gcloud compute instances describe "$INSTANCE_NAME" --zone "$ZONE" --project "$PROJECT" --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
+EXTERNAL_IP=$(gcloud compute instances describe "$INSTANCE_NAME" --zone="$ZONE" --project="$PROJECT" --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null)
 
 # Print the information
+echo "========================================"
+echo "VM CREATION COMPLETE"
+echo "========================================"
 echo "VM Name: $INSTANCE_NAME"
 echo "Project: $PROJECT"
 echo "Zone: $ZONE"
 echo "Authentication Method: Google Account (enable-oslogin=true)"
 echo "External IP Address: $EXTERNAL_IP"
 echo "To login, use your Google account credentials."
-
-# The rest of your commands (ops-agents policies, resource policies)
-# **IMPORTANT:  The following commands may fail if the OS Config API is not enabled
-# and you don't have permissions to enable it.  Consider removing them if necessary.**
-# printf 'agentsRule:\n  packageState: installed\n  version: latest\ninstanceFilter:\n  inclusionLabels:\n  - labels:\n#      goog-ops-agent-policy: v2-x86-template-1-4-0\n' > config.yaml && gcloud compute instances ops-agents policies create goog-ops-agent-v2-x86-template-1-4-0-us-east1-c --project="$PROJECT" --zone="$ZONE" --file=config.yaml && gcloud compute resource-policies create snapshot-schedule default-schedule-1 --project="$PROJECT" --region=us-east1 --max-retention-days=14 --on-source-disk-delete=keep-auto-snapshots --daily-schedule --start-time=07:00 && gcloud compute disks add-resource-policies instance-20250320-160519 --project="$PROJECT" --zone="$ZONE" --resource-policies=projects/"$PROJECT"/regions/us-east1/resourcePolicies/default-schedule-1
+echo "========================================"
