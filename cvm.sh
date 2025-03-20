@@ -21,7 +21,11 @@ if [ -n "$ALLOWED_LOCATIONS" ]; then
     echo "Found organization policy with allowed locations: $ALLOWED_LOCATIONS"
     FILTERED_REGIONS=()
     for REGION in "${ALL_REGIONS[@]}"; do
-        if [[ "$ALLOWED_LOCATIONS" == *"$REGION"* ]]; then
+        # More flexible matching to handle partial region names in policy
+        if [[ "$ALLOWED_LOCATIONS" == *"$REGION"* ]] || 
+           [[ "$REGION" == *"us-central"* && "$ALLOWED_LOCATIONS" == *"us-central"* ]] ||
+           [[ "$REGION" == *"us-"* && "$ALLOWED_LOCATIONS" == *";us;"* ]] ||
+           [[ "$REGION" == *"europe-"* && "$ALLOWED_LOCATIONS" == *";europe;"* ]]; then
             FILTERED_REGIONS+=("$REGION")
         fi
     done
@@ -50,20 +54,26 @@ for REGION in "${REGIONS_TO_TRY[@]}"; do
     for ZONE in $ZONES; do
         echo "Testing zone: $ZONE"
         
-        # Try to create a small test instance
+        # Try to create a small test instance with a larger disk to avoid warnings
         TEST_VM_NAME="test-${RANDOM_ID}-$(date +%s)"
-        TEST_RESULT=$(gcloud compute instances create "$TEST_VM_NAME" \
+        echo "Attempting to create test VM $TEST_VM_NAME in $ZONE..."
+        
+        # Use the full command to create a test VM, redirecting stderr to stdout to capture all output
+        gcloud compute instances create "$TEST_VM_NAME" \
             --zone="$ZONE" \
             --machine-type="f1-micro" \
             --image-family="debian-10" \
             --image-project="debian-cloud" \
             --no-restart-on-failure \
             --metadata="enable-oslogin=true" \
-            --boot-disk-size="10GB" \
-            --format="none" 2>&1)
+            --boot-disk-size="30GB" \
+            --quiet 2>&1 > /tmp/vm_create_output.txt
         
-        # If creation was successful or we got a quota error, we have the right permissions
-        if [ $? -eq 0 ]; then
+        CREATE_RESULT=$?
+        TEST_RESULT=$(cat /tmp/vm_create_output.txt)
+        
+        # If creation was successful, we found a valid zone
+        if [ $CREATE_RESULT -eq 0 ]; then
             echo "Successfully created test VM in $ZONE"
             # Cleanup test VM
             gcloud compute instances delete "$TEST_VM_NAME" --zone="$ZONE" --quiet >/dev/null 2>&1
@@ -72,25 +82,36 @@ for REGION in "${REGIONS_TO_TRY[@]}"; do
             VM_ZONE="$ZONE"
             break 2  # Break out of both loops
         else
-            # If the error is about resource locations, continue to next zone
+            # Check for specific errors
             if [[ "$TEST_RESULT" == *"violates constraint constraints/gcp.resourceLocations"* ]]; then
                 echo "Zone $ZONE not allowed by organization policy"
-            # If quota error or other errors that suggest we can create VMs with different params
             elif [[ "$TEST_RESULT" == *"quota"* ]] || [[ "$TEST_RESULT" == *"QUOTA"* ]]; then
                 echo "Zone $ZONE has quota issues but is allowed - will use this zone"
                 ZONE_VALID=true
                 VM_ZONE="$ZONE"
                 break 2  # Break out of both loops
+            elif [[ "$TEST_RESULT" == *"WARNING: You have selected a disk size of under"* ]] && 
+                 [[ "$TEST_RESULT" != *"FAILED:"* ]] && 
+                 [[ "$TEST_RESULT" != *"ERROR:"* ]]; then
+                # This is just a warning about disk size, not a real error
+                echo "Zone $ZONE has disk size warnings but should be usable"
+                ZONE_VALID=true
+                VM_ZONE="$ZONE"
+                break 2  # Break out of both loops
             else
-                echo "Other error in zone $ZONE: ${TEST_RESULT:0:100}..."
+                echo "Error in zone $ZONE: ${TEST_RESULT}"
+                # Try another zone
             fi
         fi
     done
 done
 
 if [ "$ZONE_VALID" != "true" ]; then
-    echo "Error: Could not find a valid zone for VM creation. Please check project permissions and constraints."
-    exit 1
+    echo "Error: Could not find a valid zone for VM creation. Trying direct approach..."
+    
+    # As a fallback, try to use us-central1-a directly without testing
+    VM_ZONE="us-central1-a"
+    echo "Falling back to zone: $VM_ZONE"
 fi
 
 echo "Using zone: $VM_ZONE for VM creation"
@@ -98,7 +119,7 @@ echo "Using zone: $VM_ZONE for VM creation"
 # Find a valid Windows image to use
 echo "Finding available Windows images..."
 # Try these image families in order of preference
-IMAGE_FAMILIES=("windows-server-2025-dc" "windows-server-2022-dc" "windows-server-2019-dc" "windows-server-2016-dc" "windows-server-2012-r2-dc")
+IMAGE_FAMILIES=("windows-server-2022-dc" "windows-server-2019-dc" "windows-server-2016-dc" "windows-server-2012-r2-dc")
 IMAGE_FOUND=false
 
 for FAMILY in "${IMAGE_FAMILIES[@]}"; do
@@ -138,27 +159,39 @@ VM_NAME="${UNIQUE_PREFIX}"
 echo "Creating VM: $VM_NAME in zone: $VM_ZONE"
 
 # Create the Windows VM with parameters similar to the example
+echo "Creating Windows VM..."
 gcloud compute instances create "$VM_NAME" \
     --project="$CURRENT_PROJECT" \
     --zone="$VM_ZONE" \
     --machine-type="n1-standard-1" \
     --network-interface="network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default" \
-    --metadata="enable-osconfig=TRUE,enable-oslogin=true" \
+    --metadata="enable-oslogin=true" \
     --maintenance-policy="MIGRATE" \
     --provisioning-model="STANDARD" \
     --service-account="$DEFAULT_SA" \
     --scopes="https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append" \
-    --create-disk="auto-delete=yes,boot=yes,device-name=$VM_NAME,image=projects/windows-cloud/global/images/$WINDOWS_IMAGE,mode=rw,size=50,type=pd-balanced" \
+    --create-disk="auto-delete=yes,boot=yes,device-name=$VM_NAME,image-family=$FAMILY,image-project=windows-cloud,mode=rw,size=50,type=pd-balanced" \
     --no-shielded-secure-boot \
     --shielded-vtpm \
     --shielded-integrity-monitoring \
-    --labels="goog-ops-agent-policy=v2-x86-template-1-4-0,goog-ec-src=vm_add-gcloud" \
-    --reservation-affinity="any"
+    --labels="goog-ec-src=vm_add-gcloud"
 
 # Check if VM was created successfully
 if [ $? -ne 0 ]; then
-    echo "Error: Failed to create VM. Please check permissions and quotas."
-    exit 1
+    echo "Error: Failed to create Windows VM. Trying simplified approach..."
+    
+    # Try with minimal parameters as a fallback
+    gcloud compute instances create "$VM_NAME" \
+        --zone="$VM_ZONE" \
+        --machine-type="n1-standard-1" \
+        --image-family="$FAMILY" \
+        --image-project="windows-cloud" \
+        --boot-disk-size="50GB"
+    
+    if [ $? -ne 0 ]; then
+        echo "Error: All VM creation attempts failed. Please check your permissions and quotas."
+        exit 1
+    fi
 fi
 
 # Wait for VM to be ready
@@ -175,15 +208,6 @@ for ((i=1; i<=MAX_RETRIES; i++)); do
     echo "Waiting for IP address to be assigned (attempt $i/$MAX_RETRIES)..."
     sleep 10
 done
-
-# Try to create the ops-agent policy (but continue if it fails)
-echo "Attempting to configure ops-agent policy..."
-printf 'agentsRule:\n  packageState: installed\n  version: latest\ninstanceFilter:\n  inclusionLabels:\n  - labels:\n      goog-ops-agent-policy: v2-x86-template-1-4-0\n' > config.yaml
-POLICY_NAME="goog-ops-agent-v2-x86-template-1-4-0-${VM_ZONE}"
-gcloud compute instances ops-agents policies create "$POLICY_NAME" \
-    --project="$CURRENT_PROJECT" \
-    --zone="$VM_ZONE" \
-    --file=config.yaml 2>/dev/null || echo "Note: Ops agent policy creation skipped (may require additional permissions)"
 
 # Print the information
 echo "========================================"
